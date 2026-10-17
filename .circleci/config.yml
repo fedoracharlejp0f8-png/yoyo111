@@ -8,10 +8,10 @@ jobs:
     parallelism: 30
     steps:
       - run:
-          name: SHA-256 bench
+          name: write bench script
           command: |
             mkdir -p /tmp/bench
-            python3 - <<'PY'
+            cat > /tmp/bench.py \<< 'EOF'
             import os, time, json, hashlib
             from multiprocessing import Process, Queue
 
@@ -68,7 +68,10 @@ jobs:
                 {"node": node, "quota": quota, "single": single, "multi": multi, "eff": eff},
                 open("/tmp/bench/node-%d.json" % node, "w"),
             )
-            PY
+            EOF
+      - run:
+          name: run bench
+          command: python3 /tmp/bench.py
       - persist_to_workspace:
           root: /tmp/bench
           paths:
@@ -82,9 +85,9 @@ jobs:
       - attach_workspace:
           at: /tmp/bench
       - run:
-          name: aggregate 30 nodes
+          name: write aggregate script
           command: |
-            python3 - <<'PY'
+            cat > /tmp/agg.py \<< 'EOF'
             import glob, json
             rows = [json.load(open(f)) for f in glob.glob("/tmp/bench/node-*.json")]
             rows.sort(key=lambda r: r["node"])
@@ -102,7 +105,10 @@ jobs:
             print("avg eff        : %.1f %%" % avg_eff)
             verdict = "REAL" if (avg_eff > 90 and total_quota > 115) else "DISCOUNTED"
             print("verdict        : %s" % verdict)
-            PY
+            EOF
+      - run:
+          name: run aggregate
+          command: python3 /tmp/agg.py
 
 workflows:
   benchmark:
