@@ -1,0 +1,113 @@
+version: 2.1
+
+jobs:
+  bench:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: large
+    parallelism: 30
+    steps:
+      - run:
+          name: SHA-256 bench
+          command: |
+            mkdir -p /tmp/bench
+            python3 - <<'PY'
+            import os, time, json, hashlib
+            from multiprocessing import Process, Queue
+
+            CORES    = 4
+            DURATION = 15
+
+            node = int(os.environ.get("CIRCLE_NODE_INDEX", 0))
+            tot  = int(os.environ.get("CIRCLE_NODE_TOTAL", 1))
+
+            def worker(seconds, q):
+                data = b"circleci-benchmark-seed"
+                end = time.time() + seconds
+                count = 0
+                while time.time() < end:
+                    for _ in range(10000):
+                        data = hashlib.sha256(data).digest()
+                        count += 1
+                q.put(count)
+
+            def run_phase(n, seconds):
+                q = Queue()
+                procs = [Process(target=worker, args=(seconds, q)) for _ in range(n)]
+                t0 = time.time()
+                for p in procs: p.start()
+                results = [q.get() for _ in range(n)]
+                for p in procs: p.join()
+                return sum(results) / (time.time() - t0)
+
+            def cpu_quota():
+                try:
+                    q, p = open("/sys/fs/cgroup/cpu.max").read().split()
+                    return None if q == "max" else int(q) / int(p)
+                except FileNotFoundError:
+                    pass
+                try:
+                    q = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+                    p = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+                    return None if q < 0 else q / p
+                except FileNotFoundError:
+                    return None
+
+            quota  = cpu_quota()
+            single = run_phase(1, DURATION)
+            multi  = run_phase(CORES, DURATION)
+            eff    = multi / (single * CORES) * 100
+
+            print("=== Node %d/%d | SHA-256 bench ===" % (node + 1, tot))
+            print("cgroup quota: %s cores" % (round(quota, 2) if quota else "unlimited"))
+            print("single-core : %.0f H/s" % single)
+            print("4-core      : %.0f H/s" % multi)
+            print("scaling eff : %.1f %% (ideal 100)" % eff)
+
+            json.dump(
+                {"node": node, "quota": quota, "single": single, "multi": multi, "eff": eff},
+                open("/tmp/bench/node-%d.json" % node, "w"),
+            )
+            PY
+      - persist_to_workspace:
+          root: /tmp/bench
+          paths:
+            - "*.json"
+
+  aggregate:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: small
+    steps:
+      - attach_workspace:
+          at: /tmp/bench
+      - run:
+          name: aggregate 30 nodes
+          command: |
+            python3 - <<'PY'
+            import glob, json
+            rows = [json.load(open(f)) for f in glob.glob("/tmp/bench/node-*.json")]
+            rows.sort(key=lambda r: r["node"])
+
+            total_multi = sum(r["multi"] for r in rows)
+            total_quota = sum(r["quota"] for r in rows if r["quota"])
+            avg_single  = sum(r["single"] for r in rows) / len(rows)
+            avg_eff     = sum(r["eff"] for r in rows) / len(rows)
+
+            print("=== 30-container total ===")
+            print("nodes reported : %d / 30" % len(rows))
+            print("quota sum      : %.1f cores (claimed 120)" % total_quota)
+            print("total H/s      : %.0f" % total_multi)
+            print("avg single     : %.0f H/s" % avg_single)
+            print("avg eff        : %.1f %%" % avg_eff)
+            verdict = "REAL" if (avg_eff > 90 and total_quota > 115) else "DISCOUNTED"
+            print("verdict        : %s" % verdict)
+            PY
+
+workflows:
+  benchmark:
+    jobs:
+      - bench
+      - aggregate:
+          requires:
+            - bench
